@@ -1,0 +1,99 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - sentiment_network
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    networks:
+      - sentiment_network
+    restart: unless-stopped
+
+  parser:
+    build: ./parser
+    environment:
+      DB_HOST: postgres
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+    depends_on:
+      - postgres
+    networks:
+      - sentiment_network
+    restart: unless-stopped
+
+  sentiment:
+    build: ./sentiment
+    environment:
+      DB_HOST: postgres
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+    ports:
+      - "8001:8000"
+    depends_on:
+      - postgres
+    networks:
+      - sentiment_network
+    restart: unless-stopped
+
+  scheduler:
+    build: ./scheduler
+    environment:
+      DB_HOST: postgres
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      REDIS_HOST: redis
+    depends_on:
+      - postgres
+      - redis
+      - parser
+      - sentiment
+    networks:
+      - sentiment_network
+    restart: unless-stopped
+
+  dashboard:
+    build: ./dashboard
+    environment:
+      DB_HOST: postgres
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+    ports:
+      - "8501:8501"
+    depends_on:
+      - postgres
+    networks:
+      - sentiment_network
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - sentiment
+      - dashboard
+    networks:
+      - sentiment_network
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+
+networks:
+  sentiment_network:
+    driver: bridge

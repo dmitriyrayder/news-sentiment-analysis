@@ -1,0 +1,10 @@
+{
+  "sources": [
+    {"name": "Pravda", "url": "https://www.pravda.com.ua/rss/", "lang": "uk"},
+    {"name": "BBC Ukrainian", "url": "https://www.bbc.com/ukrainian/news/rss", "lang": "uk"},
+    {"name": "Lenta", "url": "https://lenta.ru/rss", "lang": "ru"},
+    {"name": "RBC", "url": "https://rssexport.rbc.ru/rbcnews/news/30/full.rss", "lang": "ru"},
+    {"name": "BBC News", "url": "http://feeds.bbci.co.uk/news/rss.xml", "lang": "en"},
+    {"name": "CNN", "url": "http://rss.cnn.com/rss/edition.rss", "lang": "en"}
+  ]
+}

@@ -1,0 +1,33 @@
+# News Sentiment Analysis System
+
+Система анализа тональности новостей на 3 языках (украинский, русский, английский).
+
+## Архитектура
+
+- **Parser**: Сбор новостей через RSS каждые 2 часа
+- **Sentiment API**: ML анализ тональности (FastAPI + Transformers)
+- **Dashboard**: Визуализация (Streamlit)
+- **Scheduler**: Автоматизация задач
+- **PostgreSQL**: Хранение данных
+- **Redis**: Очередь задач
+- **Nginx**: Reverse proxy
+
+## Быстрый старт
+```bash
+docker-compose up -d --build
+```
+
+Dashboard: http://localhost
+
+API: http://localhost/api/stats
+
+## Мониторинг
+```bash
+docker-compose logs -f
+docker-compose ps
+```
+
+## Остановка
+```bash
+docker-compose down
+```

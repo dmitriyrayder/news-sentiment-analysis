@@ -1,0 +1,164 @@
+План системы анализа тональности новостей
+1. Архитектура
+
+Parser/Scraper - сбор новостей (RSS, API новостных сайтов)
+Sentiment Analyzer - ML модель для анализа тональности
+Database - PostgreSQL для хранения новостей и результатов
+API - FastAPI для доступа к данным
+Dashboard - Streamlit/Grafana для визуализации
+Scheduler - периодический запуск парсинга (Celery + Redis)
+
+2. ML компонент
+Варианты модели:
+
+Transformer (dostoevsky, RuBERT) - для русского языка
+Hugging Face модели (multilingual-sentiment)
+Или простой вариант: TextBlob/VADER для старта
+
+3. Docker stack
+
+parser - контейнер со скрейпером
+sentiment - контейнер с ML моделью
+api - FastAPI сервис
+dashboard - визуализация
+postgres - БД
+redis - для очереди задач
+nginx - reverse proxy
+
+4. Workflow
+
+Scheduler запускает parser каждые N минут
+Parser собирает новости → сохраняет в DB
+Sentiment analyzer берёт новые записи → анализирует → обновляет DB
+Dashboard показывает статистику в реальном времени
+
+5. CI/CD
+
+GitHub Actions для деплоя на VPS
+Docker Compose для оркестрации
+Мониторинг через Prometheus/Grafana
+
+Вопросы:
+
+Какие источники новостей планируешь? (украинские, русские, английские?)
+Нужен real-time или пакетная обработка?
+Какой объём данных ожидаешь в день?
+Dпрограмма тестовая :
+украинские -2 ресурас
+русские- 2 ресурса,
+ английские -2 ресурса.
+пакетная обработка
+объём данных - средний.
+Что еще тебе необходимо ?Отлично, этого достаточно. Уточню детали:
+Технические решения
+1. Parser
+
+Используем feedparser для RSS или BeautifulSoup для прямого парсинга
+Какие конкретно сайты? (нужны URL для проверки структуры)
+
+2. Sentiment модель
+Предлагаю:
+
+Украинский: ukr-sentiment или multilingual BERT
+Русский: dostoevsky или RuBERT-tiny
+Английский: distilbert-base-uncased-finetuned-sst-2
+
+Или один multilingual: cardiffnlp/twitter-xlm-roberta-base-sentiment
+3. Частота обработки
+
+Парсинг каждые 30 мин / 1 час / 6 часов?
+Сколько новостей за раз: ~50-100 или больше?
+
+4. Dashboard метрики
+
+Тональность по времени (позитив/негатив/нейтрал)
+Топ источников
+Облако слов
+Распределение по языкам
+
+5. Хранение
+
+Сколько дней хранить историю? (7/30/90 дней?)
+
+Что мне нужно от тебя:
+
+Список конкретных новостных сайтов (6 URL)
+Частота парсинга
+Период хранения данных
+
+После этого сделаю детальную архитектуру с docker-compose.DПредложи оптимальный баланс. Проетк демонстрационный.Оптимальная конфигурация для демо
+1. Источники новостей (RSS)
+Украинские:
+
+pravda.com.ua/rss
+bbc.com/ukrainian/news/rss
+
+Русские:
+
+lenta.ru/rss
+rbc.ru/rss/news
+
+Английские:
+
+feeds.bbci.co.uk/news/rss.xml
+rss.cnn.com/rss/edition.rss
+
+2. Модель
+Один multilingual: cardiffnlp/twitter-xlm-roberta-base-sentiment
+
+Поддерживает все 3 языка
+Легковесный (~500MB)
+Быстрый inference
+
+3. Расписание
+
+Парсинг: каждые 2 часа
+Объём: ~30-50 новостей за раз
+Обработка: сразу после парсинга
+
+4. Хранение
+
+14 дней истории
+Auto-cleanup старых записей
+
+5. Stack
+parser (Python + feedparser)
+sentiment (FastAPI + transformers)
+postgres (данные)
+redis (очередь)
+streamlit (dashboard)
+nginx (proxy)
+6. Dashboard
+
+График тональности за 7 дней
+Счётчики: позитив/негатив/нейтрал
+Последние 20 новостей с оценками
+Фильтр по языку/источнику
+
+Итого: легко разворачивается, быстро работает, наглядно демонстрирует возможности.
+Начинаем с docker-compose и структуры проекта?DдаСтруктура проекта
+sentiment-news/
+├── docker-compose.yml
+├── .env
+├── nginx/
+│   └── nginx.conf
+├── parser/
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   ├── parser.py
+│   └── sources.json
+├── sentiment/
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   └── app.py
+├── dashboard/
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   └── app.py
+├── scheduler/
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   └── tasks.py
+└── init.sql
+docker-compose.yml
+yamlversion: '3.8'
