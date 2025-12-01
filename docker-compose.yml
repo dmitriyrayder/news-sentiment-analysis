@@ -11,6 +11,11 @@ services:
     networks:
       - sentiment_network
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   redis:
     image: redis:7-alpine
@@ -41,10 +46,17 @@ services:
     ports:
       - "8001:8000"
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     networks:
       - sentiment_network
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
   scheduler:
     build: ./scheduler
@@ -70,13 +82,21 @@ services:
       DB_NAME: ${DB_NAME}
       DB_USER: ${DB_USER}
       DB_PASSWORD: ${DB_PASSWORD}
+      SENTIMENT_API: http://sentiment:8000
     ports:
       - "8501:8501"
     depends_on:
       - postgres
+      - sentiment
     networks:
       - sentiment_network
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
 
   nginx:
     image: nginx:alpine
