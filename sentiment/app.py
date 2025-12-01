@@ -371,6 +371,530 @@ def generate_decision_recommendations(risk_score, trust_score, momentum, is_anom
 
     return recommendations
 
+# ============================================================================
+# ВРЕМЕННЫЕ ПАТТЕРНЫ И ТРЕНДЫ
+# ============================================================================
+
+def analyze_emerging_topics(conn, days=7):
+    """
+    Определение восходящих тем (emerging topics)
+    Сравнивает активность ключевых слов за разные периоды
+    """
+    cursor = conn.cursor()
+
+    # Ключевые слова за последние 2 дня
+    cursor.execute("""
+        SELECT unnest(keywords) as keyword, COUNT(*) as count
+        FROM sentiment_results sr
+        JOIN news n ON sr.news_id = n.id
+        WHERE n.published_date >= NOW() - INTERVAL '2 days'
+        AND keywords IS NOT NULL
+        GROUP BY keyword
+        ORDER BY count DESC
+        LIMIT 50
+    """)
+    recent_keywords = {row[0]: row[1] for row in cursor.fetchall()}
+
+    # Ключевые слова за предыдущий период (3-7 дней назад)
+    cursor.execute("""
+        SELECT unnest(keywords) as keyword, COUNT(*) as count
+        FROM sentiment_results sr
+        JOIN news n ON sr.news_id = n.id
+        WHERE n.published_date >= NOW() - INTERVAL '7 days'
+        AND n.published_date < NOW() - INTERVAL '2 days'
+        AND keywords IS NOT NULL
+        GROUP BY keyword
+        ORDER BY count DESC
+        LIMIT 50
+    """)
+    older_keywords = {row[0]: row[1] for row in cursor.fetchall()}
+
+    emerging = []
+    declining = []
+
+    for keyword, recent_count in recent_keywords.items():
+        older_count = older_keywords.get(keyword, 0)
+
+        # Рост более чем в 2 раза
+        if older_count > 0:
+            growth_rate = (recent_count - older_count) / older_count
+            if growth_rate > 1.0:  # 100% рост
+                emerging.append({
+                    'keyword': keyword,
+                    'recent_mentions': recent_count,
+                    'previous_mentions': older_count,
+                    'growth_rate': round(growth_rate, 2)
+                })
+        elif recent_count >= 5:  # Новая тема
+            emerging.append({
+                'keyword': keyword,
+                'recent_mentions': recent_count,
+                'previous_mentions': 0,
+                'growth_rate': 'new'
+            })
+
+    # Угасающие темы
+    for keyword, older_count in older_keywords.items():
+        recent_count = recent_keywords.get(keyword, 0)
+        if older_count > 5 and recent_count < older_count / 2:
+            decline_rate = (older_count - recent_count) / older_count
+            declining.append({
+                'keyword': keyword,
+                'recent_mentions': recent_count,
+                'previous_mentions': older_count,
+                'decline_rate': round(decline_rate, 2)
+            })
+
+    return {
+        'emerging': sorted(emerging, key=lambda x: x['recent_mentions'], reverse=True)[:10],
+        'declining': sorted(declining, key=lambda x: x['previous_mentions'], reverse=True)[:10]
+    }
+
+def calculate_sentiment_volatility(conn, category, days=7):
+    """
+    Волатильность настроений - насколько резко меняется sentiment
+    Высокая волатильность = нестабильная ситуация
+    """
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT
+            DATE(n.published_date) as date,
+            AVG(CASE
+                WHEN sr.sentiment = 'positive' THEN 1
+                WHEN sr.sentiment = 'negative' THEN -1
+                ELSE 0
+            END) as avg_sentiment
+        FROM sentiment_results sr
+        JOIN news n ON sr.news_id = n.id
+        WHERE sr.category = %s
+        AND n.published_date >= NOW() - INTERVAL '%s days'
+        GROUP BY DATE(n.published_date)
+        ORDER BY date
+    """, (category, days))
+
+    data = cursor.fetchall()
+
+    if len(data) < 3:
+        return 0.0
+
+    sentiments = [row[1] for row in data if row[1] is not None]
+
+    if len(sentiments) < 2:
+        return 0.0
+
+    # Стандартное отклонение как мера волатильности
+    volatility = stdev(sentiments)
+
+    return round(volatility, 3)
+
+# ============================================================================
+# ДЕТЕКЦИЯ ПРОПАГАНДЫ И МАНИПУЛЯЦИЙ
+# ============================================================================
+
+def detect_propaganda_patterns(text, source, category):
+    """
+    Детекция признаков пропаганды и манипуляций
+    """
+    propaganda_score = 0.0
+    flags = []
+
+    text_lower = text.lower()
+
+    # 1. Эмоциональная манипуляция
+    emotional_words = ['ужас', 'шок', 'катастрофа', 'скандал', 'сенсация',
+                       'horror', 'shock', 'disaster', 'scandal', 'sensation']
+    emotional_count = sum(1 for word in emotional_words if word in text_lower)
+    if emotional_count >= 3:
+        propaganda_score += 0.3
+        flags.append('emotional_manipulation')
+
+    # 2. Абсолютные утверждения
+    absolute_patterns = ['все знают', 'никто не', 'всегда', 'никогда', 'каждый',
+                         'everyone knows', 'nobody', 'always', 'never', 'everybody']
+    if any(pattern in text_lower for pattern in absolute_patterns):
+        propaganda_score += 0.2
+        flags.append('absolute_statements')
+
+    # 3. Нас vs Них (дихотомия)
+    us_vs_them = ['наши враги', 'они против нас', 'our enemies', 'they against us']
+    if any(pattern in text_lower for pattern in us_vs_them):
+        propaganda_score += 0.25
+        flags.append('us_vs_them')
+
+    # 4. Призыв к действию без аргументов
+    call_to_action = ['мы должны', 'необходимо', 'пора', 'we must', 'it is time']
+    if any(pattern in text_lower for pattern in call_to_action):
+        propaganda_score += 0.15
+        flags.append('call_to_action')
+
+    # 5. Односторонность (только негатив или только позитив по политике/войне)
+    if category in ['politics', 'war/conflict']:
+        if text_lower.count('!') > 5:
+            propaganda_score += 0.1
+            flags.append('excessive_exclamation')
+
+    return {
+        'propaganda_score': min(1.0, propaganda_score),
+        'flags': flags,
+        'risk_level': 'high' if propaganda_score > 0.6 else 'medium' if propaganda_score > 0.3 else 'low'
+    }
+
+def calculate_source_consistency_score(source, conn):
+    """
+    Индекс последовательности источника
+    Проверяет, насколько стабилен источник в качестве
+    """
+    cursor = conn.cursor()
+
+    # Статистика за последние 30 дней
+    cursor.execute("""
+        SELECT
+            AVG(is_fake_probability) as avg_fake,
+            STDDEV(is_fake_probability) as std_fake,
+            AVG(CASE WHEN is_clickbait THEN 1 ELSE 0 END) as clickbait_rate,
+            COUNT(*) as total
+        FROM sentiment_results sr
+        JOIN news n ON sr.news_id = n.id
+        WHERE n.source = %s
+        AND n.published_date >= NOW() - INTERVAL '30 days'
+    """, (source,))
+
+    result = cursor.fetchone()
+
+    if not result or result[3] < 10:
+        return {
+            'consistency_score': 50,
+            'status': 'insufficient_data',
+            'total_articles': result[3] if result else 0
+        }
+
+    avg_fake, std_fake, clickbait_rate, total = result
+
+    # Чем меньше разброс - тем лучше
+    consistency = 100
+
+    if avg_fake:
+        consistency -= avg_fake * 30  # Средняя фейковость
+
+    if std_fake and std_fake > 0.2:  # Высокая нестабильность
+        consistency -= 20
+
+    if clickbait_rate > 0.3:
+        consistency -= 15
+
+    consistency = max(0, min(100, consistency))
+
+    return {
+        'consistency_score': round(consistency, 2),
+        'status': 'reliable' if consistency > 70 else 'questionable' if consistency > 40 else 'unreliable',
+        'total_articles': total,
+        'avg_fake_probability': round(avg_fake, 3) if avg_fake else 0,
+        'stability': 'stable' if (std_fake or 0) < 0.15 else 'unstable'
+    }
+
+# ============================================================================
+# СОЦИАЛЬНЫЙ АНАЛИЗ
+# ============================================================================
+
+def analyze_society_fears(conn, region=None):
+    """
+    Анализ страхов общества по ключевым словам и категориям
+    """
+    cursor = conn.cursor()
+
+    fear_categories = {
+        'war': ['war', 'война', 'conflict', 'конфликт', 'attack', 'атака'],
+        'economy': ['crisis', 'кризис', 'inflation', 'инфляция', 'poverty', 'бедность'],
+        'health': ['pandemic', 'пандемия', 'disease', 'болезнь', 'virus', 'вирус'],
+        'climate': ['climate', 'климат', 'disaster', 'катастрофа', 'flood', 'наводнение'],
+        'crime': ['crime', 'преступ', 'terror', 'террор', 'violence', 'насилие']
+    }
+
+    fears = {}
+
+    for fear_type, keywords in fear_categories.items():
+        # Подсчет новостей с высоким индексом страха по каждой категории
+        keyword_conditions = ' OR '.join([f"LOWER(n.title || ' ' || n.description) LIKE %s" for _ in keywords])
+
+        cursor.execute(f"""
+            SELECT
+                COUNT(*) as count,
+                AVG(sr.fear_index) as avg_fear,
+                AVG(sr.importance_score) as avg_importance
+            FROM sentiment_results sr
+            JOIN news n ON sr.news_id = n.id
+            WHERE ({keyword_conditions})
+            AND n.published_date >= NOW() - INTERVAL '7 days'
+            AND sr.fear_index > 0.5
+        """, tuple(f'%{kw}%' for kw in keywords))
+
+        result = cursor.fetchone()
+
+        if result and result[0] > 0:
+            fears[fear_type] = {
+                'mention_count': result[0],
+                'avg_fear_index': round(result[1], 3) if result[1] else 0,
+                'avg_importance': round(result[2], 2) if result[2] else 0,
+                'intensity': 'high' if result[1] and result[1] > 0.7 else 'medium' if result[1] and result[1] > 0.5 else 'low'
+            }
+
+    # Сортируем по интенсивности
+    sorted_fears = dict(sorted(fears.items(), key=lambda x: x[1]['mention_count'], reverse=True))
+
+    return sorted_fears
+
+def calculate_optimism_index(conn, days=7):
+    """
+    Индекс оптимизма/пессимизма общества (0-100)
+    100 = максимальный оптимизм
+    """
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT
+            COUNT(*) FILTER (WHERE sentiment = 'positive') as positive_count,
+            COUNT(*) FILTER (WHERE sentiment = 'negative') as negative_count,
+            COUNT(*) FILTER (WHERE sentiment = 'neutral') as neutral_count,
+            AVG(fear_index) as avg_fear,
+            AVG(CASE WHEN is_clickbait THEN 1 ELSE 0 END) as clickbait_rate
+        FROM sentiment_results sr
+        JOIN news n ON sr.news_id = n.id
+        WHERE n.published_date >= NOW() - INTERVAL '%s days'
+    """ % days)
+
+    result = cursor.fetchone()
+
+    if not result:
+        return {'optimism_index': 50, 'status': 'neutral'}
+
+    pos, neg, neu, avg_fear, clickbait = result
+    total = pos + neg + neu
+
+    if total == 0:
+        return {'optimism_index': 50, 'status': 'insufficient_data'}
+
+    # Расчет индекса
+    positive_ratio = pos / total
+    negative_ratio = neg / total
+
+    optimism = 50  # Базовая точка
+    optimism += (positive_ratio - negative_ratio) * 50  # От -50 до +50
+
+    # Корректировка на страх
+    if avg_fear:
+        optimism -= avg_fear * 20
+
+    # Корректировка на кликбейт (признак паники)
+    if clickbait:
+        optimism -= clickbait * 10
+
+    optimism = max(0, min(100, optimism))
+
+    # Определение статуса
+    if optimism > 70:
+        status = 'optimistic'
+    elif optimism > 50:
+        status = 'cautiously_optimistic'
+    elif optimism > 30:
+        status = 'pessimistic'
+    else:
+        status = 'highly_pessimistic'
+
+    return {
+        'optimism_index': round(optimism, 2),
+        'status': status,
+        'sentiment_breakdown': {
+            'positive': round(positive_ratio * 100, 1),
+            'negative': round(negative_ratio * 100, 1),
+            'neutral': round((neu / total) * 100, 1)
+        }
+    }
+
+def detect_apathy_index(conn):
+    """
+    Детекция апатии общества
+    Признаки: низкая важность новостей, рост нейтрального sentiment, снижение активности
+    """
+    cursor = conn.cursor()
+
+    # Последние 3 дня vs предыдущие 7 дней
+    cursor.execute("""
+        WITH recent AS (
+            SELECT
+                AVG(importance_score) as avg_importance,
+                COUNT(*) FILTER (WHERE sentiment = 'neutral') * 100.0 / COUNT(*) as neutral_rate
+            FROM sentiment_results sr
+            JOIN news n ON sr.news_id = n.id
+            WHERE n.published_date >= NOW() - INTERVAL '3 days'
+        ),
+        older AS (
+            SELECT
+                AVG(importance_score) as avg_importance,
+                COUNT(*) FILTER (WHERE sentiment = 'neutral') * 100.0 / COUNT(*) as neutral_rate
+            FROM sentiment_results sr
+            JOIN news n ON sr.news_id = n.id
+            WHERE n.published_date >= NOW() - INTERVAL '10 days'
+            AND n.published_date < NOW() - INTERVAL '3 days'
+        )
+        SELECT
+            recent.avg_importance as recent_imp,
+            older.avg_importance as older_imp,
+            recent.neutral_rate as recent_neutral,
+            older.neutral_rate as older_neutral
+        FROM recent, older
+    """)
+
+    result = cursor.fetchone()
+
+    if not result:
+        return {'apathy_index': 0, 'status': 'insufficient_data'}
+
+    recent_imp, older_imp, recent_neutral, older_neutral = result
+
+    apathy = 0.0
+    indicators = []
+
+    # Снижение важности
+    if recent_imp and older_imp and recent_imp < older_imp - 1:
+        apathy += 0.3
+        indicators.append('declining_importance')
+
+    # Рост нейтральности
+    if recent_neutral and older_neutral and recent_neutral > older_neutral + 10:
+        apathy += 0.4
+        indicators.append('increasing_neutrality')
+
+    # Общий уровень нейтральности
+    if recent_neutral and recent_neutral > 50:
+        apathy += 0.3
+        indicators.append('high_neutrality')
+
+    apathy = min(1.0, apathy)
+
+    return {
+        'apathy_index': round(apathy, 2),
+        'status': 'high_apathy' if apathy > 0.6 else 'moderate_apathy' if apathy > 0.3 else 'engaged',
+        'indicators': indicators
+    }
+
+# ============================================================================
+# БИЗНЕС-ИНДИКАТОРЫ
+# ============================================================================
+
+def calculate_investment_risk_index(conn, region=None, sector=None):
+    """
+    Индекс риска для инвестиций (0-100)
+    100 = максимальный риск
+    """
+    cursor = conn.cursor()
+
+    # Анализ новостей по экономике, политике, войнам
+    high_risk_categories = ['war/conflict', 'politics', 'economy']
+
+    conditions = ["sr.category = ANY(%s)"]
+    params = [high_risk_categories]
+
+    cursor.execute("""
+        SELECT
+            AVG(fear_index) as avg_fear,
+            AVG(is_fake_probability) as avg_fake,
+            COUNT(*) FILTER (WHERE sentiment = 'negative') * 100.0 / NULLIF(COUNT(*), 0) as negative_rate,
+            AVG(importance_score) as avg_importance
+        FROM sentiment_results sr
+        JOIN news n ON sr.news_id = n.id
+        WHERE sr.category = ANY(%s)
+        AND n.published_date >= NOW() - INTERVAL '7 days'
+    """, params)
+
+    result = cursor.fetchone()
+
+    if not result:
+        return {'investment_risk': 50, 'status': 'moderate'}
+
+    avg_fear, avg_fake, negative_rate, avg_importance = result
+
+    risk = 0.0
+
+    # Факторы риска
+    if avg_fear:
+        risk += avg_fear * 30  # 0-30 points
+
+    if negative_rate:
+        risk += (negative_rate / 100) * 30  # 0-30 points
+
+    if avg_importance and avg_importance > 7:
+        risk += 20  # Высокая важность = высокий риск
+
+    if avg_fake and avg_fake > 0.4:
+        risk += 20  # Много дезинформации = риск
+
+    risk = min(100, risk)
+
+    return {
+        'investment_risk': round(risk, 2),
+        'status': 'critical' if risk > 70 else 'high' if risk > 50 else 'moderate' if risk > 30 else 'low',
+        'factors': {
+            'fear_level': round(avg_fear, 3) if avg_fear else 0,
+            'negative_sentiment': round(negative_rate, 1) if negative_rate else 0,
+            'disinformation_level': round(avg_fake, 3) if avg_fake else 0
+        }
+    }
+
+def analyze_reputation_risks(source_name, conn):
+    """
+    Анализ репутационных рисков для организации/бренда
+    """
+    cursor = conn.cursor()
+
+    # Поиск упоминаний в новостях
+    cursor.execute("""
+        SELECT
+            COUNT(*) as total_mentions,
+            AVG(CASE WHEN sr.sentiment = 'negative' THEN 1 ELSE 0 END) as negative_rate,
+            AVG(sr.fear_index) as avg_fear,
+            COUNT(*) FILTER (WHERE sr.is_fake_probability > 0.6) as potential_fake_mentions
+        FROM sentiment_results sr
+        JOIN news n ON sr.news_id = n.id
+        WHERE LOWER(n.title || ' ' || COALESCE(n.description, '')) LIKE %s
+        AND n.published_date >= NOW() - INTERVAL '30 days'
+    """, (f'%{source_name.lower()}%',))
+
+    result = cursor.fetchone()
+
+    if not result or result[0] == 0:
+        return {
+            'reputation_risk': 0,
+            'status': 'no_mentions',
+            'total_mentions': 0
+        }
+
+    total, neg_rate, avg_fear, fake_count = result
+
+    risk = 0.0
+
+    # Высокий негатив
+    if neg_rate and neg_rate > 0.5:
+        risk += 40
+
+    # Страх в упоминаниях
+    if avg_fear and avg_fear > 0.6:
+        risk += 30
+
+    # Фейковые упоминания
+    if fake_count > 0:
+        risk += 30
+
+    risk = min(100, risk)
+
+    return {
+        'reputation_risk': round(risk, 2),
+        'status': 'critical' if risk > 70 else 'concerning' if risk > 40 else 'stable',
+        'total_mentions': total,
+        'negative_rate': round(neg_rate * 100, 1) if neg_rate else 0,
+        'fake_mentions': fake_count
+    }
+
 @app.get("/")
 def root():
     return {"status": "Advanced Sentiment API running"}
@@ -900,3 +1424,279 @@ def get_source_reliability():
         "total_sources": len(sources),
         "timestamp": datetime.now().isoformat()
     }
+
+# ============================================================================
+# РАСШИРЕННЫЕ ENDPOINTS ДЛЯ ГЛУБОКОЙ АНАЛИТИКИ
+# ============================================================================
+
+@app.get("/emerging-topics")
+def get_emerging_topics():
+    """
+    Восходящие и угасающие темы в новостях
+    Показывает "что волнует мир сейчас vs неделю назад"
+    """
+    conn = get_db_connection()
+
+    result = analyze_emerging_topics(conn, days=7)
+
+    conn.close()
+
+    return {
+        "emerging_topics": result['emerging'],
+        "declining_topics": result['declining'],
+        "analysis_period": "last_7_days",
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.get("/propaganda-detection")
+def detect_propaganda():
+    """
+    Детекция пропаганды и манипуляций в новостях
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Анализ последних новостей
+    cursor.execute("""
+        SELECT
+            n.id,
+            n.title,
+            n.description,
+            n.source,
+            sr.category
+        FROM news n
+        JOIN sentiment_results sr ON n.id = sr.news_id
+        WHERE n.published_date >= NOW() - INTERVAL '24 hours'
+        ORDER BY n.published_date DESC
+        LIMIT 50
+    """)
+
+    propaganda_items = []
+
+    for row in cursor.fetchall():
+        news_id, title, desc, source, category = row
+        full_text = f"{title}. {desc or ''}"
+
+        propaganda_result = detect_propaganda_patterns(full_text, source, category)
+
+        if propaganda_result['propaganda_score'] > 0.3:  # Только подозрительные
+            propaganda_items.append({
+                'news_id': news_id,
+                'title': title,
+                'source': source,
+                'propaganda_score': propaganda_result['propaganda_score'],
+                'risk_level': propaganda_result['risk_level'],
+                'flags': propaganda_result['flags']
+            })
+
+    # Сортируем по propaganda_score
+    propaganda_items.sort(key=lambda x: x['propaganda_score'], reverse=True)
+
+    cursor.close()
+    conn.close()
+
+    return {
+        "high_risk_items": [item for item in propaganda_items if item['risk_level'] == 'high'],
+        "medium_risk_items": [item for item in propaganda_items if item['risk_level'] == 'medium'],
+        "total_flagged": len(propaganda_items),
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.get("/source-consistency/{source_name}")
+def get_source_consistency(source_name: str):
+    """
+    Индекс последовательности и надежности источника
+    """
+    conn = get_db_connection()
+
+    consistency = calculate_source_consistency_score(source_name, conn)
+
+    conn.close()
+
+    return {
+        "source": source_name,
+        "consistency": consistency,
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.get("/society-analysis")
+def get_society_analysis():
+    """
+    Комплексный анализ настроений общества
+    Включает страхи, оптимизм, апатию
+    """
+    conn = get_db_connection()
+
+    # Анализ страхов
+    fears = analyze_society_fears(conn)
+
+    # Индекс оптимизма
+    optimism = calculate_optimism_index(conn, days=7)
+
+    # Индекс апатии
+    apathy = detect_apathy_index(conn)
+
+    conn.close()
+
+    return {
+        "fears": fears,
+        "optimism": optimism,
+        "apathy": apathy,
+        "summary": {
+            "dominant_fear": list(fears.keys())[0] if fears else None,
+            "mood": optimism['status'],
+            "engagement": apathy['status']
+        },
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.get("/business-intelligence")
+def get_business_intelligence():
+    """
+    Бизнес-индикаторы для принятия инвестиционных решений
+    """
+    conn = get_db_connection()
+
+    # Инвестиционный риск
+    investment_risk = calculate_investment_risk_index(conn)
+
+    # Волатильность по категориям
+    volatility = {}
+    for category in ['politics', 'economy', 'war/conflict', 'technology']:
+        vol = calculate_sentiment_volatility(conn, category, days=7)
+        if vol > 0:
+            volatility[category] = {
+                'volatility': vol,
+                'stability': 'unstable' if vol > 0.5 else 'moderate' if vol > 0.3 else 'stable'
+            }
+
+    conn.close()
+
+    return {
+        "investment_risk": investment_risk,
+        "market_volatility": volatility,
+        "recommendation": (
+            "HOLD - Высокий риск, избегайте новых инвестиций"
+            if investment_risk['investment_risk'] > 70
+            else "CAUTION - Умеренный риск, инвестируйте осторожно"
+            if investment_risk['investment_risk'] > 50
+            else "FAVORABLE - Низкий риск, благоприятные условия"
+        ),
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.get("/reputation-monitor/{brand_name}")
+def monitor_reputation(brand_name: str):
+    """
+    Мониторинг репутации бренда/организации
+    """
+    conn = get_db_connection()
+
+    reputation = analyze_reputation_risks(brand_name, conn)
+
+    conn.close()
+
+    return {
+        "brand": brand_name,
+        "reputation_analysis": reputation,
+        "action_required": reputation['status'] in ['critical', 'concerning'],
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.get("/volatility-index")
+def get_volatility_index():
+    """
+    Индекс волатильности новостей по всем категориям
+    """
+    conn = get_db_connection()
+
+    categories = ['war/conflict', 'politics', 'economy', 'technology',
+                  'health', 'environment', 'sports', 'entertainment']
+
+    volatility_data = []
+
+    for category in categories:
+        vol = calculate_sentiment_volatility(conn, category, days=7)
+        if vol > 0:
+            volatility_data.append({
+                'category': category,
+                'volatility': vol,
+                'status': 'highly_volatile' if vol > 0.6 else 'volatile' if vol > 0.4 else 'stable'
+            })
+
+    # Сортируем по волатильности
+    volatility_data.sort(key=lambda x: x['volatility'], reverse=True)
+
+    # Общий индекс волатильности
+    avg_volatility = mean([item['volatility'] for item in volatility_data]) if volatility_data else 0
+
+    conn.close()
+
+    return {
+        "overall_volatility": round(avg_volatility, 3),
+        "status": 'unstable' if avg_volatility > 0.5 else 'moderate' if avg_volatility > 0.3 else 'stable',
+        "categories": volatility_data,
+        "interpretation": (
+            "Крайне нестабильная информационная среда. Высокий риск резких изменений."
+            if avg_volatility > 0.6
+            else "Умеренная волатильность. Ситуация может измениться."
+            if avg_volatility > 0.3
+            else "Стабильная информационная среда. Предсказуемая динамика."
+        ),
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.get("/comprehensive-dashboard")
+def get_comprehensive_dashboard():
+    """
+    Комплексный дашборд - все ключевые метрики для принятия решений
+    """
+    conn = get_db_connection()
+
+    # Сбор всех метрик
+    dashboard = {
+        "alerts": [],
+        "risk_assessment": {
+            "investment_risk": calculate_investment_risk_index(conn),
+            "composite_risk": None  # Будет заполнено из risk-assessment
+        },
+        "society": {
+            "optimism": calculate_optimism_index(conn),
+            "apathy": detect_apathy_index(conn),
+            "top_fears": analyze_society_fears(conn)
+        },
+        "trends": {
+            "emerging": analyze_emerging_topics(conn)
+        },
+        "recommendations": []
+    }
+
+    # Генерация главных рекомендаций
+    inv_risk = dashboard['risk_assessment']['investment_risk']['investment_risk']
+    optimism = dashboard['society']['optimism']['optimism_index']
+    apathy = dashboard['society']['apathy']['apathy_index']
+
+    if inv_risk > 70:
+        dashboard['recommendations'].append({
+            'priority': 'critical',
+            'message': 'Инвестиционный риск критический. Рекомендуется защита активов.'
+        })
+
+    if optimism < 30:
+        dashboard['recommendations'].append({
+            'priority': 'warning',
+            'message': 'Общественные настроения крайне пессимистичны. Ожидайте социальной напряженности.'
+        })
+
+    if apathy > 0.6:
+        dashboard['recommendations'].append({
+            'priority': 'info',
+            'message': 'Высокий уровень апатии. Общество устало - возможен всплеск после накопления.'
+        })
+
+    conn.close()
+
+    dashboard['timestamp'] = datetime.now().isoformat()
+    dashboard['status'] = 'operational'
+
+    return dashboard
