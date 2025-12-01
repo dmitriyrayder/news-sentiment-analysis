@@ -42,12 +42,25 @@ CREATE TABLE IF NOT EXISTS sentiment_results (
     analyzed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Индексы
+-- Индексы для базовых запросов
 CREATE INDEX idx_news_published ON news(published_date);
 CREATE INDEX idx_news_language ON news(language);
+CREATE INDEX idx_news_source ON news(source);
 CREATE INDEX idx_sentiment_news ON sentiment_results(news_id);
 CREATE INDEX idx_category ON sentiment_results(category);
 CREATE INDEX idx_importance ON sentiment_results(importance_score);
+
+-- Индексы для новой аналитики
+CREATE INDEX idx_sentiment ON sentiment_results(sentiment);
+CREATE INDEX idx_fear_index ON sentiment_results(fear_index) WHERE fear_index IS NOT NULL;
+CREATE INDEX idx_fake_probability ON sentiment_results(is_fake_probability) WHERE is_fake_probability IS NOT NULL;
+CREATE INDEX idx_clickbait ON sentiment_results(is_clickbait) WHERE is_clickbait = true;
+CREATE INDEX idx_analyzed_at ON sentiment_results(analyzed_at);
+
+-- Комбинированные индексы для сложных запросов
+CREATE INDEX idx_category_sentiment ON sentiment_results(category, sentiment);
+CREATE INDEX idx_published_category ON news(published_date, source);
+CREATE INDEX idx_keywords_gin ON sentiment_results USING GIN(keywords);
 
 -- Агрегированная статистика (для быстрых запросов)
 CREATE TABLE IF NOT EXISTS daily_stats (
